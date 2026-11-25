@@ -40,9 +40,14 @@ type mockDocumentProcessor struct {
 	mockText  string
 	mockErr   error         // returned for every document while non-nil
 	perDocErr map[int]error // returned for specific documents while set
+	ocrCalls  map[int]int
 }
 
 func (m *mockDocumentProcessor) ProcessDocumentOCR(ctx context.Context, documentID int, options OCROptions, jobID string) (*ProcessedDocument, error) {
+	if m.ocrCalls == nil {
+		m.ocrCalls = make(map[int]int)
+	}
+	m.ocrCalls[documentID]++
 	if err := m.perDocErr[documentID]; err != nil {
 		return nil, err
 	}
@@ -564,6 +569,7 @@ type recordingClient struct {
 	taggedDocuments map[string][]Document // served by GetDocumentsByTag
 	tagFetches      []string              // tags requested via GetDocumentsByTag, in order
 	getAllTagsErr   error                 // when set, GetAllTags fails — used to make suggestion generation fail
+	getDocumentErr  error                 // when set, GetDocument fails
 }
 
 func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
@@ -585,6 +591,9 @@ func (r *recordingClient) GetDocumentsByTag(ctx context.Context, tag string, pag
 // GetDocument serves the same documents GetDocumentsByTag returns, so the
 // auto-tag poll can fetch full details for one it just listed.
 func (r *recordingClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
+	if r.getDocumentErr != nil {
+		return Document{}, r.getDocumentErr
+	}
 	for _, docs := range r.taggedDocuments {
 		for _, d := range docs {
 			if d.ID == documentID {
@@ -692,6 +701,7 @@ func TestProcessAutoOcrTagDocuments_FailTagAfterMaxRetries(t *testing.T) {
 	})
 	failTag = "paperless-gpt-failed"
 	autoOcrTag = "paperless-gpt-ocr-auto"
+	disableDocumentCooldown(t)
 
 	newDoc := func(id int) Document {
 		return Document{ID: id, Title: "Broken Doc", Tags: []string{autoOcrTag}}
@@ -876,6 +886,7 @@ func TestProcessAutoTagDocuments_FailTagAfterMaxRetries(t *testing.T) {
 	})
 	failTag = "paperless-gpt-failed"
 	autoTag = "paperless-gpt-auto"
+	disableDocumentCooldown(t)
 
 	newClient := func(id int) *recordingClient {
 		return &recordingClient{
@@ -947,6 +958,7 @@ func TestProcessTagDocuments_WorkflowTriggerRemovedAfterMaxRetries(t *testing.T)
 	autoTag = "paperless-gpt-auto"
 	autoTagMaxRetries = 3
 	isolateWorkflowSettings(t)
+	disableDocumentCooldown(t)
 
 	const trigger = "paperless-gpt-invoices"
 	useWorkflows(t, []WorkflowConfig{{

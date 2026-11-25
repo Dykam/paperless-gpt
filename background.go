@@ -12,26 +12,92 @@ import (
 	"gorm.io/gorm"
 )
 
-// documentFailureTracker counts consecutive processing failures per document so
-// a poll loop can stop retrying a document that keeps failing (and re-paying the
-// provider for it every cycle). Used by the auto-OCR poll (ocrMaxRetries) and by
-// the auto-tag poll (autoTagMaxRetries). Counts are in-memory only: a restart
-// resets them, which at worst grants a persistently failing document another
-// round of attempts. The zero value is ready to use.
+// Cooldown before a failed document is attempted again: the base delay after
+// the first failure, doubling per consecutive failure up to the maximum.
+var (
+	documentRetryBaseDelay = 5 * time.Minute
+	documentRetryMaxDelay  = time.Hour
+)
+
+// documentFailureTracker counts consecutive processing failures per document,
+// so a poll loop can give up on a document that keeps failing, and gives each
+// failed document a growing cooldown so the rest of the queue keeps moving.
+// Used by the auto-OCR poll (ocrMaxRetries) and the auto-tag poll
+// (autoTagMaxRetries). In-memory only: a restart grants a persistently failing
+// document another round of attempts. The zero value is ready to use.
 type documentFailureTracker struct {
 	mu       sync.Mutex
-	failures map[int]int
+	failures map[int]documentFailure
+	now      func() time.Time // nil means time.Now
 }
 
-// recordFailure increments and returns the failure count for a document.
+type documentFailure struct {
+	count         int
+	retryAt       time.Time
+	serviceStreak int // consecutive service-unavailable attempts since the last counted failure
+}
+
+func documentRetryDelay(attempt int) time.Duration {
+	delay := documentRetryBaseDelay
+	for i := 1; i < attempt && delay < documentRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > documentRetryMaxDelay {
+		delay = documentRetryMaxDelay
+	}
+	return delay
+}
+
+func (t *documentFailureTracker) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+func (t *documentFailureTracker) entry(documentID int) documentFailure {
+	if t.failures == nil {
+		t.failures = make(map[int]documentFailure)
+	}
+	return t.failures[documentID]
+}
+
 func (t *documentFailureTracker) recordFailure(documentID int) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.failures == nil {
-		t.failures = make(map[int]int)
+	f := t.entry(documentID)
+	f.count++
+	f.serviceStreak = 0
+	f.retryAt = t.clock().Add(documentRetryDelay(f.count))
+	t.failures[documentID] = f
+	return f.count
+}
+
+// setAside holds a document back after a service-unavailable error without
+// counting the attempt, with the same growing delay as a counted failure. A
+// document that itself crashes the service is then retried at most hourly,
+// but never fail-tagged.
+func (t *documentFailureTracker) setAside(documentID int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f := t.entry(documentID)
+	f.serviceStreak++
+	if retryAt := t.clock().Add(documentRetryDelay(f.serviceStreak)); f.retryAt.Before(retryAt) {
+		f.retryAt = retryAt
 	}
-	t.failures[documentID]++
-	return t.failures[documentID]
+	t.failures[documentID] = f
+}
+
+// coolingDown reports whether a document must not be attempted before the
+// returned time.
+func (t *documentFailureTracker) coolingDown(documentID int) (time.Time, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f, ok := t.failures[documentID]
+	if !ok || !t.clock().Before(f.retryAt) {
+		return time.Time{}, false
+	}
+	return f.retryAt, true
 }
 
 // reset clears the failure count for a document. Entries for documents whose
@@ -54,11 +120,7 @@ type BackgroundProcessor interface {
 // Start our background tasks in a goroutine
 func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 	go func() {
-		minBackoffDuration := 10 * time.Second
-		maxBackoffDuration := time.Hour
-		pollingInterval := 10 * time.Second
-
-		backoffDuration := minBackoffDuration
+		backoff := pollBackoff{min: 10 * time.Second, max: 15 * time.Minute, interval: 10 * time.Second}
 
 		for {
 			select {
@@ -68,49 +130,58 @@ func StartBackgroundTasks(ctx context.Context, app BackgroundProcessor) {
 			default: // needed to make this non-blocking
 			}
 
-			processedCount, err := func() (count int, err error) {
-				count = 0
-
-				// If OCR is enabled, run OCR tagging first
-				if app.isOcrEnabled() {
-					ocrCount, err := app.processAutoOcrTagDocuments(ctx)
-					if err != nil {
-						return 0, fmt.Errorf("error in processAutoOcrTagDocuments: %w", err)
-					}
-					count += ocrCount
-				}
-
-				// Run auto-tagging after OCR
-				autoCount, err := app.processAutoTagDocuments(ctx)
-				if err != nil {
-					return 0, fmt.Errorf("error in processAutoTagDocuments: %w", err)
-				}
-				count += autoCount
-
-				return count, nil
-			}()
-
+			processedCount, err := runPollRound(ctx, app)
+			delay := backoff.next(processedCount, err)
 			if err != nil {
-				log.Errorf("Error in background tagging: %v", err)
-				time.Sleep(backoffDuration)
-
-				// Exponential backoff logic
-				backoffDuration *= 2
-				if backoffDuration > maxBackoffDuration {
-					log.Warnf("Max backoff duration reached. Using %v", maxBackoffDuration)
-					backoffDuration = maxBackoffDuration
+				if onlyDocumentErrors(err) {
+					log.Warnf("Some documents failed and will be retried after their cooldown: %v", err)
+				} else {
+					log.Errorf("Error in background tagging, next attempt in %v: %v", delay, err)
 				}
-			} else {
-				// Reset backoff when processing succeeds
-				backoffDuration = minBackoffDuration
 			}
 
-			// If nothing was processed, pause before next cycle
-			if processedCount == 0 {
-				time.Sleep(pollingInterval)
+			if delay > 0 {
+				select {
+				case <-ctx.Done():
+					log.Infoln("Background tasks shutting down")
+					return
+				case <-time.After(delay):
+				}
 			}
 		}
 	}()
+}
+
+// runPollRound runs the auto-OCR poll and then the auto-tag poll once. Both
+// run even when the first reports document failures; only a failure that is
+// not tied to one document (e.g. an unreachable service) skips the second.
+func runPollRound(ctx context.Context, app BackgroundProcessor) (int, error) {
+	count := 0
+	var errs []error
+
+	if app.isOcrEnabled() {
+		ocrCount, err := app.processAutoOcrTagDocuments(ctx)
+		count += ocrCount
+		if err != nil {
+			errs = append(errs, fmt.Errorf("error in processAutoOcrTagDocuments: %w", err))
+			if !onlyDocumentErrors(err) {
+				return count, errors.Join(errs...)
+			}
+		}
+	}
+
+	autoCount, err := app.processAutoTagDocuments(ctx)
+	count += autoCount
+	if err != nil {
+		errs = append(errs, fmt.Errorf("error in processAutoTagDocuments: %w", err))
+	}
+	return count, errors.Join(errs...)
+}
+
+// serviceUnavailable wraps err so the poll loop recognises it as a reason to
+// back off globally rather than a document failure.
+func serviceUnavailable(err error) error {
+	return fmt.Errorf("%w: %w", errServiceUnavailable, err)
 }
 
 // applyFailTagAfterPartialSuccess applies the fail tag to a document whose
@@ -210,6 +281,9 @@ func (app *App) processAutoTagDocuments(ctx context.Context) (int, error) {
 		totalProcessed += n
 		if err != nil {
 			allErrs = append(allErrs, err)
+			if errors.Is(err, errServiceUnavailable) {
+				break
+			}
 		}
 	}
 	if len(allErrs) > 0 {
@@ -224,7 +298,11 @@ func (app *App) processAutoTagDocuments(ctx context.Context) (int, error) {
 func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int, error) {
 	documents, err := app.Client.GetDocumentsByTag(ctx, triggerTag, 25)
 	if err != nil {
-		return 0, fmt.Errorf("error fetching documents with tag %q: %w", triggerTag, err)
+		err = fmt.Errorf("error fetching documents with tag %q: %w", triggerTag, err)
+		if isServiceUnavailable(err) {
+			return 0, serviceUnavailable(err)
+		}
+		return 0, err
 	}
 
 	if len(documents) == 0 {
@@ -241,12 +319,22 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 	processedCount := 0
 
 	for _, docSummary := range documents {
+		if retryAt, waiting := app.suggestionFailures.coolingDown(docSummary.ID); waiting {
+			log.Debugf("Skipping document %d until %s after a failed suggestion attempt", docSummary.ID, retryAt.Format(time.RFC3339))
+			continue
+		}
+
 		// Get the full document details, including custom fields
 		document, err := app.Client.GetDocument(ctx, docSummary.ID)
 		if err != nil {
 			err = fmt.Errorf("error fetching full details for document %d: %w", docSummary.ID, err)
 			documentLogger(docSummary.ID).Error(err.Error())
-			errs = append(errs, err)
+			if isServiceUnavailable(err) {
+				app.suggestionFailures.setAside(docSummary.ID)
+				errs = append(errs, serviceUnavailable(err))
+				return processedCount, errors.Join(errs...)
+			}
+			errs = append(errs, documentError{err})
 			continue
 		}
 
@@ -274,13 +362,21 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 					err = fmt.Errorf("workflow %q has enable_ocr but no OCR provider is configured", wf.ID)
 					docLogger.Error(err.Error())
 					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, "workflow OCR is enabled but no OCR provider is configured"); recErr != nil {
-						errs = append(errs, fmt.Errorf("%w (removing the %q tag failed: %v)", err, triggerTag, recErr))
+						errs = append(errs, documentError{fmt.Errorf("%w (removing the %q tag failed: %v)", err, triggerTag, recErr)})
 					}
+					continue
+				}
+				if retryAt, waiting := app.ocrFailures.coolingDown(document.ID); waiting {
+					docLogger.Debugf("Skipping workflow OCR until %s after a failed attempt", retryAt.Format(time.RFC3339))
 					continue
 				}
 				updatedDoc, ocrErr := app.runWorkflowDocumentOCR(ctx, document, wf, triggerTag, docLogger)
 				if ocrErr != nil {
-					errs = append(errs, ocrErr)
+					if errors.Is(ocrErr, errServiceUnavailable) {
+						errs = append(errs, ocrErr)
+						return processedCount, errors.Join(errs...)
+					}
+					errs = append(errs, documentError{ocrErr})
 					continue
 				}
 				if updatedDoc == nil {
@@ -308,33 +404,32 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 			// and because GetDocumentsByTag fetches one unordered page, enough
 			// such documents fill that page and starve every document behind
 			// them — silently, since the container stays healthy. See #1071.
-			//
+			if isServiceUnavailable(err) {
+				app.suggestionFailures.setAside(document.ID)
+				errs = append(errs, serviceUnavailable(err))
+				return processedCount, errors.Join(errs...)
+			}
 			// A canceled poll-loop context is a shutdown, not a document
 			// problem, so it must never count against the document. Same
 			// reasoning as the auto-OCR poll below.
-			if autoTagMaxRetries > 0 && ctx.Err() == nil {
+			if ctx.Err() == nil {
 				attempts := app.suggestionFailures.recordFailure(document.ID)
-				if attempts >= autoTagMaxRetries {
+				if autoTagMaxRetries > 0 && attempts >= autoTagMaxRetries {
 					reason := fmt.Sprintf("suggestion generation failed %d times", attempts)
 					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
 						// Keep the failure count so the tag removal is retried
-						// on the next poll cycle.
-						docLogger.Errorf("Removing %q tag after repeated suggestion failures also failed: %v. The document will be retried on the next poll cycle.", triggerTag, recErr)
-						errs = append(errs, err)
+						// once the cooldown ends.
+						docLogger.Errorf("Removing %q tag after repeated suggestion failures also failed: %v. The document will be retried after its cooldown.", triggerTag, recErr)
+						errs = append(errs, documentError{err})
 						continue
 					}
 					app.suggestionFailures.reset(document.ID)
-					// The document is out of the queue now; don't let its
-					// handled error keep the whole loop in backoff.
 					continue
 				}
 			}
-			errs = append(errs, err)
+			errs = append(errs, documentError{err})
 			continue
 		}
-		// Suggestions came back — a previous failure streak is over, whatever
-		// the update below does.
-		app.suggestionFailures.reset(document.ID)
 
 		err = app.Client.UpdateDocuments(ctx, suggestions, app.Database, false)
 		if err != nil {
@@ -346,16 +441,28 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 				// retry's tag update). Apply the fail tag so the user sees
 				// that this document needs review.
 				applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+				app.suggestionFailures.reset(document.ID)
 				processedCount++
 				continue
 			}
 			err = fmt.Errorf("error updating document %d: %w", document.ID, err)
 			docLogger.Error(err.Error())
-			errs = append(errs, err)
+			// Keep the trigger tag on an outage, so the document is processed
+			// again once paperless-ngx is back.
+			if isServiceUnavailable(err) {
+				app.suggestionFailures.setAside(document.ID)
+				errs = append(errs, serviceUnavailable(err))
+				return processedCount, errors.Join(errs...)
+			}
+			// The cooldown matters when the recovery PATCH fails too and the
+			// trigger tag stays.
+			app.suggestionFailures.recordFailure(document.ID)
+			errs = append(errs, documentError{err})
 			recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
 			continue
 		}
 
+		app.suggestionFailures.reset(document.ID)
 		docLogger.Info("Successfully processed document")
 		processedCount++
 	}
@@ -376,6 +483,7 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		for _, tag := range document.Tags {
 			if tag == app.pdfOCRCompleteTag {
 				docLogger.Infof("Document already has OCR complete tag '%s', skipping workflow OCR", app.pdfOCRCompleteTag)
+				app.ocrFailures.reset(document.ID)
 				return &document, nil
 			}
 		}
@@ -425,9 +533,13 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		jobStore.updateJobStatus(jobID, "failed", err.Error())
 		finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")
 
-		if ocrMaxRetries > 0 && ctx.Err() == nil {
+		if isServiceUnavailable(err) {
+			app.ocrFailures.setAside(document.ID)
+			return nil, serviceUnavailable(fmt.Errorf("document %d workflow OCR error: %w", document.ID, err))
+		}
+		if ctx.Err() == nil {
 			attempts := app.ocrFailures.recordFailure(document.ID)
-			if attempts >= ocrMaxRetries {
+			if ocrMaxRetries > 0 && attempts >= ocrMaxRetries {
 				reason := fmt.Sprintf("OCR failed %d times", attempts)
 				if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, triggerTag, reason); recErr != nil {
 					docLogger.Errorf("Removing %q tag after repeated OCR failures also failed: %v", triggerTag, recErr)
@@ -440,8 +552,8 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		return nil, fmt.Errorf("document %d workflow OCR error: %w", document.ID, err)
 	}
 
-	app.ocrFailures.reset(document.ID)
 	if processedDoc == nil {
+		app.ocrFailures.reset(document.ID)
 		docLogger.Info("Workflow OCR processing skipped for document")
 		jobStore.updateJobStatus(jobID, "completed", "Skipped (already processed)")
 		finishOCRRunLogged(app, jobID, "completed", "", pagesDone, totalPages, "none", "Skipped (already processed)")
@@ -473,14 +585,22 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 		var partial *PartialUpdateError
 		if errors.As(err, &partial) {
 			applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+			app.ocrFailures.reset(document.ID)
 			document.Content = processedDoc.Text
 			return &document, nil
 		}
 		docLogger.Errorf("Update after workflow OCR failed: %v", err)
+		err = fmt.Errorf("document %d update after workflow OCR error: %w", document.ID, err)
+		if isServiceUnavailable(err) {
+			app.ocrFailures.setAside(document.ID)
+			return nil, serviceUnavailable(err)
+		}
+		app.ocrFailures.recordFailure(document.ID)
 		recoverFromFailedUpdate(ctx, app.Client, app.Database, document, triggerTag)
-		return nil, fmt.Errorf("document %d update after workflow OCR error: %w", document.ID, err)
+		return nil, err
 	}
 
+	app.ocrFailures.reset(document.ID)
 	document.Content = processedDoc.Text
 	if app.pdfOCRTagging && app.pdfOCRCompleteTag != "" && !slices.Contains(document.Tags, app.pdfOCRCompleteTag) {
 		document.Tags = append(document.Tags, app.pdfOCRCompleteTag)
@@ -493,7 +613,11 @@ func (app *App) runWorkflowDocumentOCR(ctx context.Context, document Document, w
 func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 	documents, err := app.Client.GetDocumentsByTag(ctx, autoOcrTag, 25)
 	if err != nil {
-		return 0, fmt.Errorf("error fetching documents with autoOcrTag: %w", err)
+		err = fmt.Errorf("error fetching documents with autoOcrTag: %w", err)
+		if isServiceUnavailable(err) {
+			return 0, serviceUnavailable(err)
+		}
+		return 0, err
 	}
 
 	if len(documents) == 0 {
@@ -508,6 +632,10 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 
 	for _, document := range documents {
 		docLogger := documentLogger(document.ID)
+		if retryAt, waiting := app.ocrFailures.coolingDown(document.ID); waiting {
+			docLogger.Debugf("Skipping OCR until %s after a failed attempt", retryAt.Format(time.RFC3339))
+			continue
+		}
 		docLogger.Info("Processing document for OCR")
 
 		// Skip OCR if the document already has the OCR complete tag and tagging is enabled
@@ -535,7 +663,14 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 
 				if err != nil {
 					docLogger.Errorf("Update to remove autoOcrTag failed: %v", err)
-					errs = append(errs, fmt.Errorf("document %d update error: %w", document.ID, err))
+					err = fmt.Errorf("document %d update error: %w", document.ID, err)
+					if isServiceUnavailable(err) {
+						app.ocrFailures.setAside(document.ID)
+						errs = append(errs, serviceUnavailable(err))
+						return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+					}
+					app.ocrFailures.recordFailure(document.ID)
+					errs = append(errs, documentError{err})
 					continue
 				}
 
@@ -594,36 +729,38 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 			jobStore.updateJobStatus(jobID, "failed", err.Error())
 			finishOCRRunLogged(app, jobID, "failed", err.Error(), pagesDone, totalPages, "", "")
 
+			err = fmt.Errorf("document %d OCR error: %w", document.ID, err)
+			if isServiceUnavailable(err) {
+				app.ocrFailures.setAside(document.ID)
+				errs = append(errs, serviceUnavailable(err))
+				return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+			}
 			// A canceled/expired poll-loop context is a shutdown, not a
 			// document problem — never count it against the document.
 			// Deliberately checked on ctx rather than via errors.Is on err:
 			// providers wrap their calls in their own timeout contexts
 			// (e.g. Azure, ocr/azure_provider.go), and those per-document
 			// timeouts must count toward the limit.
-			if ocrMaxRetries > 0 && ctx.Err() == nil {
+			if ctx.Err() == nil {
 				attempts := app.ocrFailures.recordFailure(document.ID)
-				if attempts >= ocrMaxRetries {
+				if ocrMaxRetries > 0 && attempts >= ocrMaxRetries {
 					reason := fmt.Sprintf("OCR failed %d times", attempts)
 					if recErr := markProcessingFailed(ctx, app.Client, app.Database, document, autoOcrTag, reason); recErr != nil {
 						// Keep the failure count so the tag removal is
-						// retried on the next poll cycle.
-						docLogger.Errorf("Removing %q tag after repeated OCR failures also failed: %v. The document will be retried on the next poll cycle.", autoOcrTag, recErr)
-						errs = append(errs, fmt.Errorf("document %d OCR error: %w", document.ID, err))
+						// retried once the cooldown ends.
+						docLogger.Errorf("Removing %q tag after repeated OCR failures also failed: %v. The document will be retried after its cooldown.", autoOcrTag, recErr)
+						errs = append(errs, documentError{err})
 						continue
 					}
 					app.ocrFailures.reset(document.ID)
-					// The document is out of the queue now; don't let its
-					// handled error keep the whole loop in backoff.
 					continue
 				}
 			}
-			errs = append(errs, fmt.Errorf("document %d OCR error: %w", document.ID, err))
+			errs = append(errs, documentError{err})
 			continue
 		}
-		// OCR itself succeeded — a previous failure streak is over,
-		// whatever the update below does.
-		app.ocrFailures.reset(document.ID)
 		if processedDoc == nil {
+			app.ocrFailures.reset(document.ID)
 			docLogger.Info("OCR processing skipped for document")
 			jobStore.updateJobStatus(jobID, "completed", "Skipped (already processed)")
 			finishOCRRunLogged(app, jobID, "completed", "", pagesDone, totalPages, "none", "Skipped (already processed)")
@@ -669,18 +806,29 @@ func (app *App) processAutoOcrTagDocuments(ctx context.Context) (int, error) {
 				var partial *PartialUpdateError
 				if errors.As(err, &partial) {
 					applyFailTagAfterPartialSuccess(ctx, app.Client, app.Database, partial.DocumentID, partial.DroppedFields)
+					app.ocrFailures.reset(document.ID)
 					// Treat as a (partial) success: tag was removed, fail tag applied.
 					docLogger.Info("Successfully processed document OCR (with partial-update fail-tag marker)")
 					successCount++
 					continue
 				}
 				docLogger.Errorf("Update after OCR failed: %v", err)
-				errs = append(errs, fmt.Errorf("document %d update error: %w", document.ID, err))
+				err = fmt.Errorf("document %d update error: %w", document.ID, err)
+				if isServiceUnavailable(err) {
+					app.ocrFailures.setAside(document.ID)
+					errs = append(errs, serviceUnavailable(err))
+					return successCount, fmt.Errorf("one or more errors occurred: %w", errors.Join(errs...))
+				}
+				// The cooldown matters when the recovery PATCH fails too and the
+				// trigger tag stays.
+				app.ocrFailures.recordFailure(document.ID)
+				errs = append(errs, documentError{err})
 				recoverFromFailedUpdate(ctx, app.Client, app.Database, document, autoOcrTag)
 				continue
 			}
 		}
 
+		app.ocrFailures.reset(document.ID)
 		docLogger.Info("Successfully processed document OCR")
 		successCount++
 	}
