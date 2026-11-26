@@ -292,6 +292,16 @@ func (app *App) processAutoTagDocuments(ctx context.Context) (int, error) {
 	return totalProcessed, nil
 }
 
+// workflowOCRCoolingDown routes on the tag listing's document so a document
+// waiting out a failed workflow OCR is skipped before it is fetched in full.
+func (app *App) workflowOCRCoolingDown(doc Document, triggerTag string) (time.Time, bool) {
+	wf := app.workflowRouter().WorkflowFor(doc, triggerTag)
+	if wf == nil || !workflowWantsOCR(*wf) {
+		return time.Time{}, false
+	}
+	return app.ocrFailures.coolingDown(doc.ID)
+}
+
 // processTagDocuments fetches documents with the given tag and runs the
 // suggestion pipeline for each of them, with the workflow the router picks
 // for the document or the global settings.
@@ -321,6 +331,10 @@ func (app *App) processTagDocuments(ctx context.Context, triggerTag string) (int
 	for _, docSummary := range documents {
 		if retryAt, waiting := app.suggestionFailures.coolingDown(docSummary.ID); waiting {
 			log.Debugf("Skipping document %d until %s after a failed suggestion attempt", docSummary.ID, retryAt.Format(time.RFC3339))
+			continue
+		}
+		if retryAt, waiting := app.workflowOCRCoolingDown(docSummary, triggerTag); waiting {
+			log.Debugf("Skipping document %d until %s after a failed workflow OCR attempt", docSummary.ID, retryAt.Format(time.RFC3339))
 			continue
 		}
 

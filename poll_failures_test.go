@@ -395,6 +395,7 @@ func TestProcessTagDocuments_WorkflowOCRFailureKinds(t *testing.T) {
 		assert.True(t, onlyDocumentErrors(err))
 		_, _ = app.processAutoTagDocuments(context.Background())
 		assert.Equal(t, 1, processor.ocrCalls[41], "skipped during the cooldown")
+		assert.Equal(t, 1, client.documentFetches[41], "not fetched during the cooldown")
 
 		clock.advance(documentRetryBaseDelay)
 		_, _ = app.processAutoTagDocuments(context.Background())

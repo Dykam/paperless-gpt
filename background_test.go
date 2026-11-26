@@ -570,6 +570,7 @@ type recordingClient struct {
 	tagFetches      []string              // tags requested via GetDocumentsByTag, in order
 	getAllTagsErr   error                 // when set, GetAllTags fails — used to make suggestion generation fail
 	getDocumentErr  error                 // when set, GetDocument fails
+	documentFetches map[int]int
 }
 
 func (r *recordingClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
@@ -591,6 +592,10 @@ func (r *recordingClient) GetDocumentsByTag(ctx context.Context, tag string, pag
 // GetDocument serves the same documents GetDocumentsByTag returns, so the
 // auto-tag poll can fetch full details for one it just listed.
 func (r *recordingClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
+	if r.documentFetches == nil {
+		r.documentFetches = map[int]int{}
+	}
+	r.documentFetches[documentID]++
 	if r.getDocumentErr != nil {
 		return Document{}, r.getDocumentErr
 	}
