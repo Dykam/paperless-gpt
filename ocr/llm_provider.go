@@ -39,6 +39,8 @@ type LLMProvider struct {
 	maxTokens   int
 	temperature *float64
 	ollamaTopK  *int
+
+	loopRepeatPenalty float64
 }
 
 // WithPrompt returns a shallow copy of the provider with a different prompt.
@@ -98,6 +100,8 @@ func newLLMProvider(config Config) (*LLMProvider, error) {
 		maxTokens:   config.VisionLLMMaxTokens,
 		temperature: config.VisionLLMTemperature,
 		ollamaTopK:  config.OllamaOcrTopK,
+
+		loopRepeatPenalty: config.OllamaOcrLoopRepeatPenalty,
 	}, nil
 }
 
@@ -192,6 +196,7 @@ func (p *LLMProvider) ProcessImage(ctx context.Context, imageContent []byte, pag
 	logger.Debug("Sending request to vision model")
 	var completion *llms.ContentResponse
 	var genErr error
+	loopRetried := false
 	for attempt := 0; ; attempt++ {
 		completion, genErr = p.llm.GenerateContent(ctx, []llms.MessageContent{
 			{
@@ -203,6 +208,13 @@ func (p *LLMProvider) ProcessImage(ctx context.Context, imageContent []byte, pag
 			break
 		}
 		msg := genErr.Error()
+		if !loopRetried && p.loopRepeatPenalty > 0 && providerName == "ollama" && strings.Contains(msg, "token repeat limit reached") {
+			loopRetried = true
+			logger.WithError(genErr).Warnf("Vision model looped on this page; retrying once with repeat penalty %g", p.loopRepeatPenalty)
+			callOpts = append(callOpts, llms.WithRepetitionPenalty(p.loopRepeatPenalty))
+			attempt-- // the loop retry does not use up a transient retry
+			continue
+		}
 		transient := strings.Contains(msg, "status code: 429") || strings.Contains(msg, "status code: 5")
 		if !transient || attempt >= maxRetries {
 			logger.WithError(genErr).Error("Failed to get response from vision model")

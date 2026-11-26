@@ -15,11 +15,17 @@ import (
 
 // fakeVisionLLM returns the queued errors in order, then succeeds.
 type fakeVisionLLM struct {
-	errs  []error
-	calls int
+	errs      []error
+	calls     int
+	penalties []float64
 }
 
 func (f *fakeVisionLLM) GenerateContent(ctx context.Context, messages []llms.MessageContent, options ...llms.CallOption) (*llms.ContentResponse, error) {
+	var opts llms.CallOptions
+	for _, o := range options {
+		o(&opts)
+	}
+	f.penalties = append(f.penalties, opts.RepetitionPenalty)
 	i := f.calls
 	f.calls++
 	if i < len(f.errs) {
@@ -108,6 +114,55 @@ func TestProcessImage_ContextCanceledDuringBackoff(t *testing.T) {
 
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.Equal(t, 1, llm.calls)
+}
+
+func TestProcessImage_TokenLoopRetriesOnceWithRepeatPenalty(t *testing.T) {
+	t.Setenv("VISION_LLM_MAX_RETRIES", "8")
+	loop := errors.New("prediction aborted, token repeat limit reached")
+	newProvider := func(llm llms.Model, providerName string, penalty float64) *LLMProvider {
+		p := retryTestProvider(llm)
+		p.provider = providerName
+		p.loopRepeatPenalty = penalty
+		return p
+	}
+
+	t.Run("recovers", func(t *testing.T) {
+		llm := &fakeVisionLLM{errs: []error{loop}}
+		result, err := newProvider(llm, "ollama", 1.3).ProcessImage(context.Background(), testJPEG(t), 1)
+		assert.NoError(t, err)
+		assert.Equal(t, "ocr text", result.Text)
+		assert.Equal(t, []float64{0, 1.3}, llm.penalties)
+	})
+
+	t.Run("gives up after one retry", func(t *testing.T) {
+		llm := &fakeVisionLLM{errs: []error{loop, loop}}
+		_, err := newProvider(llm, "ollama", 1.3).ProcessImage(context.Background(), testJPEG(t), 1)
+		assert.ErrorIs(t, err, loop)
+		assert.Equal(t, 2, llm.calls)
+	})
+
+	t.Run("keeps the penalty and the full transient retry budget", func(t *testing.T) {
+		t.Setenv("VISION_LLM_MAX_RETRIES", "1")
+		t.Setenv("VISION_LLM_BACKOFF_MAX_WAIT", "1ms")
+		llm := &fakeVisionLLM{errs: []error{loop, errors.New("API returned unexpected status code: 503")}}
+		_, err := newProvider(llm, "ollama", 1.3).ProcessImage(context.Background(), testJPEG(t), 1)
+		assert.NoError(t, err)
+		assert.Equal(t, []float64{0, 1.3, 1.3}, llm.penalties)
+	})
+
+	t.Run("disabled with 0", func(t *testing.T) {
+		llm := &fakeVisionLLM{errs: []error{loop}}
+		_, err := newProvider(llm, "ollama", 0).ProcessImage(context.Background(), testJPEG(t), 1)
+		assert.Error(t, err)
+		assert.Equal(t, 1, llm.calls)
+	})
+
+	t.Run("ollama only", func(t *testing.T) {
+		llm := &fakeVisionLLM{errs: []error{loop}}
+		_, err := newProvider(llm, "openai", 1.3).ProcessImage(context.Background(), testJPEG(t), 1)
+		assert.Error(t, err)
+		assert.Equal(t, 1, llm.calls)
+	})
 }
 
 func TestProcessImage_ZeroRetriesRestoresFailFast(t *testing.T) {

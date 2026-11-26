@@ -56,6 +56,8 @@ type Config struct {
 	// Ollama OCR-specific settings
 	OllamaOcrTopK       *int
 	OllamaContextLength int
+	// Repeat penalty for the one retry of a page Ollama aborted as a token loop; 0 disables the retry.
+	OllamaOcrLoopRepeatPenalty float64
 
 	// Google Document AI settings
 	GoogleProjectID   string

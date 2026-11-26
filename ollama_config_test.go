@@ -12,6 +12,14 @@ import (
 	"github.com/tmc/langchaingo/llms"
 )
 
+func TestParseOllamaOcrLoopRepeatPenalty(t *testing.T) {
+	for value, want := range map[string]float64{
+		"": 1.3, "1.1": 1.1, "0": 0, "-1": 1.3, "abc": 1.3, "Inf": 1.3, "NaN": 1.3,
+	} {
+		assert.Equal(t, want, parseOllamaOcrLoopRepeatPenalty(value), "value %q", value)
+	}
+}
+
 func TestApplyOllamaMetadataEnvironment(t *testing.T) {
 	// A non-empty starting point, so "invalid input is ignored" can be told
 	// apart from "invalid input resets to zero".

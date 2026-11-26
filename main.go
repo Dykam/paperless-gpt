@@ -347,6 +347,8 @@ func main() {
 		}
 	}
 
+	ollamaOcrLoopRepeatPenalty := parseOllamaOcrLoopRepeatPenalty(os.Getenv("OLLAMA_OCR_LOOP_REPEAT_PENALTY"))
+
 	var mistralImageLimit *int
 	if limitStr := os.Getenv("MISTRAL_OCR_IMAGE_LIMIT"); limitStr != "" {
 		if parsed, err := strconv.Atoi(limitStr); err == nil {
@@ -413,6 +415,7 @@ func main() {
 		GoogleAIAPIKey:           os.Getenv("GOOGLEAI_API_KEY"),
 		GoogleAIThinkingBudget:   googleThinkingBudget,
 	}
+	ocrConfig.OllamaOcrLoopRepeatPenalty = ollamaOcrLoopRepeatPenalty
 
 	// Parse Azure timeout if set
 	if azureDocAITimeout != "" {
@@ -1119,6 +1122,20 @@ func removeSystemTags(tags []string) []string {
 }
 
 // getLikelyLanguage determines the likely language of the document content
+const defaultOllamaOcrLoopRepeatPenalty = 1.3
+
+func parseOllamaOcrLoopRepeatPenalty(value string) float64 {
+	if value == "" {
+		return defaultOllamaOcrLoopRepeatPenalty
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed < 0 || math.IsInf(parsed, 0) || math.IsNaN(parsed) {
+		log.Warnf("Invalid OLLAMA_OCR_LOOP_REPEAT_PENALTY value %q, using %g", value, defaultOllamaOcrLoopRepeatPenalty)
+		return defaultOllamaOcrLoopRepeatPenalty
+	}
+	return parsed
+}
+
 func getLikelyLanguage() string {
 	likelyLanguage := os.Getenv("LLM_LANGUAGE")
 	if likelyLanguage == "" {
